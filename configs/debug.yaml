@@ -1,0 +1,33 @@
+experiment_name: "debug_run"
+seed: 123
+device: "cuda:0"
+output_dir: "runs/debug_run"
+
+data:
+  train_csv: "/data1/open_data/seamless_interaction/preprocessed/train/clips.csv"
+  val_csv: null       # derive a small val split
+  val_split: 0.2
+  resize: 224
+  batch_size: 4
+  num_workers: 0
+  pin_memory: false
+
+model: {}
+
+optim:
+  lr: 3.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+
+train:
+  epochs: 2
+  val_every: 1
+  amp: false
+  grad_clip_norm: null
+
+loss:
+  name: "global_clip"
+  kwargs: {}          # extra kwargs for your alignment loss
+
+logger:
+  log_interval: 50
