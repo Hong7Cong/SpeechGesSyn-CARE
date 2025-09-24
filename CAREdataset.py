@@ -29,14 +29,15 @@ class SEAMLESSData(Dataset):
         self,
         csv_path: str,
         resize: Optional[int] = 224,   # fixed H=W=resize; set None to keep original
-        max_len: int = 32,            # pad/trim target along time
+        max_len: int = 8,            # pad/trim target along time
         transform: Optional[torch.nn.Module] = None,
         n_clusters: int = 8,
     ):
         self.resize = resize
         self.max_len = int(max_len)
         self.n_clusters = n_clusters
-        df = pd.read_csv(csv_path)[:800]
+        df = pd.read_csv(csv_path)[:2000] #max 3600 samples for debug
+        # assert False, len(df)
         need = {"path_to_clip", "transcript"}
         if not need.issubset(df.columns):
             raise ValueError(f"CSV must contain {need}, got {list(df.columns)}")

@@ -2,18 +2,27 @@ import argparse
 import os
 import time
 from typing import Any, Dict, Tuple, Union
-
+import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import yaml
-
+import logging
 # your code
 from loss import multimodal_alignment_loss, global_clip_loss
 from CAREdataset import SEAMLESSData, pad_time_collate
 from model import VideoFlowModel
+from datetime import datetime
+from utils.utils import log_cuda
+import subprocess
+import time
 
-
+def get_gpu_usage():
+    result = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=timestamp,index,utilization.gpu,memory.used,memory.total",
+         "--format=csv,noheader,nounits"]
+    )
+    return result.decode("utf-8").strip()
 # ---------------------------
 # Utils
 # ---------------------------
@@ -56,11 +65,12 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
     batch_size = data_cfg.get("batch_size", 4)
     num_workers = data_cfg.get("num_workers", 4)
     pin_memory = data_cfg.get("pin_memory", False)
+    max_len = data_cfg.get("max_len", 8)  # max frames per video
 
-    ds_train = SEAMLESSData(train_csv, resize=resize)
+    ds_train = SEAMLESSData(train_csv, resize=resize, max_len=max_len)
 
     if val_csv:
-        ds_val = SEAMLESSData(val_csv, resize=resize)
+        ds_val = SEAMLESSData(val_csv, resize=resize, max_len=max_len)
     else:
         # Fallback: small validation split from training data
         val_split = data_cfg.get("val_split", 0.05)
@@ -91,6 +101,19 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
 
     return loader_train, loader_val
 
+def log_non_trainable_params(model: nn.Module, log_file: str = "non_grad_params.log"):
+    with open(log_file, "w") as f:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                f.write(f"{name} | shape: {tuple(param.shape)} | dtype: {param.dtype}\n")
+    print(f"Non-require grad parameters have been written to {log_file}")
+
+def log_trainable_params(model: nn.Module, log_file: str = "grad_params.log"):
+    with open(log_file, "w") as f:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                f.write(f"{name} | shape: {tuple(param.shape)} | dtype: {param.dtype}\n")
+    print(f"Non-require grad parameters have been written to {log_file}")
 # ---------------------------
 # Model / Optim / Loss
 # ---------------------------
@@ -166,10 +189,13 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
     log_interval = cfg.get("logger", {}).get("log_interval", 50)
     grad_clip = cfg["train"].get("grad_clip_norm", None)
     use_amp = cfg["train"].get("amp", False) and torch.cuda.is_available()
+    accum = int(cfg["train"].get("accum_steps", 1))
 
     running = 0.0
     n = 0
     t0 = time.time()
+
+    optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader, 1):
         vids = move_to_device(batch["video"], device)
@@ -177,9 +203,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
         v_mask = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
         t_mask = move_to_device(batch.get("text_mask", None), device) if "text_mask" in batch else None
 
-        optimizer.zero_grad(set_to_none=True)
+        # optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with autocast(device_type="cuda", enabled=use_amp):
             v_feats, t_feats = model(vids, transcript)
             loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
 
@@ -189,8 +215,13 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        scaler.step(optimizer)
-        scaler.update()
+        # Add gradient accumulation (bigger global batch without more VRAM)
+        # scaler.step(optimizer)
+        # scaler.update()
+        if step % accum == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         running += float(loss.item())
         n += 1
@@ -200,6 +231,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
             elapsed = time.time() - t0
             print(f"[Epoch {epoch:03d} | Step {step:05d}] loss={avg:.4f} ({format_seconds(elapsed)})")
 
+    log_cuda()
+        # print(get_gpu_usage())
     return {"train_loss": running / max(1, n)}
 
 # ---------------------------
@@ -233,9 +266,9 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    seed = cfg.get("seed", 42)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    # seed = cfg.get("seed", 42)
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed_all(seed)
 
     device = resolve_device(cfg.get("device", "auto"))
     out_dir = cfg.get("output_dir", "runs/default")
@@ -247,6 +280,9 @@ def main():
 
     loader_train, loader_val = build_dataloaders(cfg)
     model = build_model(cfg, device)
+    log_non_trainable_params(model)
+    log_trainable_params(model)
+    # assert False
     optimizer = build_optimizer(cfg, model)
     scaler = build_scaler(cfg)
     loss_fn = get_loss_fn(cfg)
@@ -270,18 +306,22 @@ def main():
     val_every = cfg["train"].get("val_every", 1)
 
     wall0 = time.time()
+    ts = datetime.now().strftime("%Y%m%d")
+
     for epoch in range(start_epoch, epochs + 1):
         train_stats = train_one_epoch(model, loader_train, optimizer, scaler, device, loss_fn, epoch, cfg)
         msg = f"Epoch {epoch:03d} | train_loss={train_stats['train_loss']:.4f}"
-
+        ensure_dir(os.path.join(out_dir, "run" + ts))
         if (epoch % val_every) == 0:
             val_stats = evaluate(model, loader_val, device, loss_fn, cfg)
             msg += f" | val_loss={val_stats['val_loss']:.4f}"
-            best_val = maybe_save_best(best_val, val_stats["val_loss"], out_dir, model, optimizer, scaler, epoch, cfg)
+            best_val = maybe_save_best(best_val, val_stats["val_loss"], out_dir + "/run" + ts, model, optimizer, scaler, epoch, cfg)
 
         print(msg)
-
+        # print(get_gpu_usage())
         # Save "last" every epoch
+    
+        
         save_checkpoint({
             "epoch": epoch,
             "model": model.state_dict(),
@@ -289,7 +329,7 @@ def main():
             "scaler": scaler.state_dict(),
             "cfg": cfg,
             "best_val_loss": best_val,
-        }, os.path.join(out_dir, "last.pt"))
+        }, os.path.join(out_dir, "run" + ts, "last.pt"))
 
     print(f"Done. Total time: {format_seconds(time.time() - wall0)}")
     

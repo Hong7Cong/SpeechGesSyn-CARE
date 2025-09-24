@@ -13,6 +13,19 @@ import torch.nn.functional as F
 import cv2
 from torch import nn
 
+
+def _gb(x): return x / (1024**3)
+
+def log_cuda(gpu: int = 0, tag: str = ""):
+    torch.cuda.synchronize(gpu)  # make numbers accurate
+    alloc    = torch.cuda.memory_allocated(gpu)     # tensors you own
+    reserved = torch.cuda.memory_reserved(gpu)      # cached by PyTorch
+    free, tot = torch.cuda.mem_get_info(gpu)        # driver view (free/total)
+    peak    = torch.cuda.max_memory_allocated(gpu)  # peak since last reset
+    print(f"[GPU{gpu}] {tag}  alloc={_gb(alloc):.2f}GB  "
+          f"reserved={_gb(reserved):.2f}GB  free={_gb(free):.2f}/{_gb(tot):.2f}GB  "
+          f"peak_alloc={_gb(peak):.2f}GB")
+
 class MaybeToTensor(nn.Module):
     def forward(self, x):
         import numpy as np

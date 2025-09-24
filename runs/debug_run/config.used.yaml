@@ -1,9 +1,10 @@
 data:
   batch_size: 4
+  max_len: 32
   num_workers: 0
   pin_memory: false
   resize: 224
-  train_csv: /data1/open_data/seamless_interaction/preprocessed/train/clips.csv
+  train_csv: /project2/shrikann_35/hongn/seamless_interaction/preprocessed/train/clips.csv
   val_csv: null
   val_split: 0.2
 device: cuda:0
@@ -18,12 +19,12 @@ optim:
   betas:
   - 0.9
   - 0.999
-  lr: 3.0e-05
-  weight_decay: 0.0
+  lr: 0.001
+  weight_decay: 0
 output_dir: runs/debug_run
-seed: 123
 train:
-  amp: false
-  epochs: 2
-  grad_clip_norm: null
+  accum_steps: 1
+  amp: true
+  epochs: 50
+  grad_clip_norm: 1.0
   val_every: 1

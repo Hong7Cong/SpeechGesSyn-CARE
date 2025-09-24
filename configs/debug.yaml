@@ -1,29 +1,31 @@
 experiment_name: "debug_run"
-seed: 123
+# seed: 123
 device: "cuda:0"
 output_dir: "runs/debug_run"
 
 data:
-  train_csv: "/data1/open_data/seamless_interaction/preprocessed/train/clips.csv"
+  train_csv: "/project2/shrikann_35/hongn/seamless_interaction/preprocessed/train/clips.csv"
   val_csv: null       # derive a small val split
   val_split: 0.2
   resize: 224
   batch_size: 4
   num_workers: 0
   pin_memory: false
+  max_len: 32          # max frames per video
 
 model: {}
 
 optim:
-  lr: 3.0e-5
-  weight_decay: 0.0
+  lr: 1.0e-3
+  weight_decay: 0
   betas: [0.9, 0.999]
 
 train:
-  epochs: 2
+  epochs: 50
   val_every: 1
-  amp: false
-  grad_clip_norm: null
+  amp: true
+  grad_clip_norm: 1.0 # null
+  accum_steps: 1 # ONLY 1 FOR NOW, HAVE NOT FIXED BUGS FOR >1
 
 loss:
   name: "global_clip"

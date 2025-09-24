@@ -26,15 +26,34 @@ class VideoFlowModel(nn.Module):
         # self.video_enc = AutoModel.from_pretrained('facebook/dinov2-base').cuda()
         self.video_enc = TimesformerModel.from_pretrained("facebook/timesformer-base-finetuned-k400")
         self.text_enc = AutoModelForMaskedLM.from_pretrained("roberta-base")
-    
+
+        #Freeze some weights
         self.text_enc.lm_head = nn.Identity()
         self.text_enc.requires_grad_(False)
-        # self.fuse = nn.Sequential(
-        #     nn.Linear(emb_dim * 2, fusion_dim),
-        #     nn.ReLU(inplace=True),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(fusion_dim, num_classes),
-        # )
+        self.text_enc.eval()
+        
+        for param in self.video_enc.parameters():
+            param.requires_grad = False
+        for i in range(10, 12):  # base model has 12 encoder blocks         # Unfreeze the last 4 blocks
+            for param in self.video_enc.encoder.layer[i].parameters():
+                param.requires_grad = True    
+        for i in range(12):         # Unfreeze temporal attention across *all* blocks
+            for name, param in self.video_enc.encoder.layer[i].named_parameters():
+                if "temporal" in name:
+                    param.requires_grad = True
+
+        # assert False, self.video_enc
+        self.vid_proj = self.proj_head(768, 512)
+        self.txt_proj = self.proj_head(768, 512)
+
+    def proj_head(self, d_in, d_out):
+        return nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, d_out),
+            nn.GELU(),
+            nn.Linear(d_out, d_out)
+        )
+
     def add_magnitude(self, flow):
         # Compute sqrt(dx^2 + dy^2) along channel dim=1
         magnitude = torch.sqrt(flow[:, 0]**2 + flow[:, 1]**2)  # [B, H, W]
@@ -50,13 +69,16 @@ class VideoFlowModel(nn.Module):
         """
         x: (B, C, T, H, W) -> per-frame features (B, T, D)
         """
-        B, C, T, H, W = x.shape
+        # B, C, T, H, W = x.shape
         # x = rearrange(x, 'B C T H W -> B T C H W') # (B*T, C, H, W)
         # if is_flow:
         #     x = self.add_magnitude(x)
         # if processor:
         #     x = processor(images=list(x), return_tensors="pt", device=x.device)
         # x = rearrange(x, 'B C T H W -> (B T) H W C')
+        # assert False, x.shape
+        if x.dim() == 5 and x.shape[1] in (3, 1):  # likely (B, C, T, H, W)
+            x = rearrange(x, 'b c t h w -> b t c h w')
         f = enc(x).last_hidden_state[:,:1]                                       # (B*T, D)
         # assert False, f.shape
         # f = rearrange(f, '(B T) P D -> B T P D')                               # (B, T, D)
@@ -73,7 +95,8 @@ class VideoFlowModel(nn.Module):
         # if processor:
         #     x = processor(images=list(x), return_tensors="pt", device=x.device)
         # x = rearrange(x, 'B C T H W -> (B T) H W C')
-        f = enc(x).logits
+        with torch.no_grad():
+            f = enc(x).logits
         # f = enc(x)                                        # (B*T, D)
         # assert False, f.shape
         # f = rearrange(f, '(B T) P D -> B T P D')                               # (B, T, D)
@@ -90,6 +113,8 @@ class VideoFlowModel(nn.Module):
         v_feats = self.encode_video(video, self.video_enc)   # (B, T, D)
         t_feats = self.encode_text(text, self.text_enc)    # (B, T, D)
 
+        v_feats = F.normalize(self.vid_proj(v_feats), dim=-1)
+        t_feats = F.normalize(self.txt_proj(t_feats), dim=-1)
         # v_pool = masked_mean(v_feats, mask)                   # (B, D)
         # f_pool = masked_mean(f_feats, mask)                   # (B, D)
 
