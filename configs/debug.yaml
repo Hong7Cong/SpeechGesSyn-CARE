@@ -21,11 +21,11 @@ optim:
   betas: [0.9, 0.999]
 
 train:
-  epochs: 50
+  epochs: 100
   val_every: 1
   amp: true
   grad_clip_norm: 1.0 # null
-  accum_steps: 1 # ONLY 1 FOR NOW, HAVE NOT FIXED BUGS FOR >1
+  accum_steps: 16 
 
 loss:
   name: "global_clip"

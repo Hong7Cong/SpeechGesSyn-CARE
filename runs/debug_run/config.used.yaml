@@ -23,8 +23,8 @@ optim:
   weight_decay: 0
 output_dir: runs/debug_run
 train:
-  accum_steps: 1
+  accum_steps: 16
   amp: true
-  epochs: 50
+  epochs: 100
   grad_clip_norm: 1.0
   val_every: 1

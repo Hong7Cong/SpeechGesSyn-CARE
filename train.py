@@ -184,12 +184,65 @@ def evaluate(model, loader, device: str, loss_fn, cfg: Dict[str, Any]) -> Dict[s
     avg_loss = total_loss / max(1, n_batches)
     return {"val_loss": avg_loss}
 
+# def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoch: int, cfg: Dict[str, Any]) -> Dict[str, float]:
+#     model.train()
+#     log_interval = cfg.get("logger", {}).get("log_interval", 50)
+#     grad_clip = cfg["train"].get("grad_clip_norm", None)
+#     use_amp = cfg["train"].get("amp", False) and torch.cuda.is_available()
+#     accum = int(cfg["train"].get("accum_steps", 1))
+
+#     running = 0.0
+#     n = 0
+#     t0 = time.time()
+
+#     optimizer.zero_grad(set_to_none=True)
+
+#     for step, batch in enumerate(loader, 1):
+#         vids = move_to_device(batch["video"], device)
+#         transcript = move_to_device(batch["transcript"], device)
+#         v_mask = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
+#         t_mask = move_to_device(batch.get("text_mask", None), device) if "text_mask" in batch else None
+
+#         # optimizer.zero_grad(set_to_none=True)
+
+#         with autocast(device_type="cuda", enabled=use_amp):
+#             v_feats, t_feats = model(vids, transcript)
+#             loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
+
+#         scaler.scale(loss).backward()
+
+#         if grad_clip is not None:
+#             scaler.unscale_(optimizer)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+#         # Add gradient accumulation (bigger global batch without more VRAM)
+#         # scaler.step(optimizer)
+#         # scaler.update()
+#         if step % accum == 0:
+#             scaler.step(optimizer)
+#             scaler.update()
+#             optimizer.zero_grad(set_to_none=True)
+
+#         running += float(loss.item())
+#         n += 1
+
+#         if step % log_interval == 0:
+#             avg = running / max(1, n)
+#             elapsed = time.time() - t0
+#             print(f"[Epoch {epoch:03d} | Step {step:05d}] loss={avg:.4f} ({format_seconds(elapsed)})")
+
+#     log_cuda()
+#         # print(get_gpu_usage())
+#     return {"train_loss": running / max(1, n)}
+
 def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoch: int, cfg: Dict[str, Any]) -> Dict[str, float]:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
     model.train()
     log_interval = cfg.get("logger", {}).get("log_interval", 50)
     grad_clip = cfg["train"].get("grad_clip_norm", None)
-    use_amp = cfg["train"].get("amp", False) and torch.cuda.is_available()
-    accum = int(cfg["train"].get("accum_steps", 1))
+    use_amp   = cfg["train"].get("amp", False) and torch.cuda.is_available()
+    accum     = int(cfg["train"].get("accum_steps", 1))
 
     running = 0.0
     n = 0
@@ -197,33 +250,37 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
 
     optimizer.zero_grad(set_to_none=True)
 
+    total_steps = len(loader)
     for step, batch in enumerate(loader, 1):
-        vids = move_to_device(batch["video"], device)
+        vids       = move_to_device(batch["video"], device)
         transcript = move_to_device(batch["transcript"], device)
-        v_mask = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
-        t_mask = move_to_device(batch.get("text_mask", None), device) if "text_mask" in batch else None
+        v_mask     = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
+        t_mask     = move_to_device(batch.get("text_mask", None), device)  if "text_mask"  in batch else None
 
-        # optimizer.zero_grad(set_to_none=True)
-
+        # --- forward (AMP + memory-efficient attention recommended) ---
         with autocast(device_type="cuda", enabled=use_amp):
-            v_feats, t_feats = model(vids, transcript)
-            loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
+            # Enable Flash/SDPA where possible (PyTorch 2.x)
+            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+                v_feats, t_feats = model(vids, transcript)
+                loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
 
+        # --- scale loss by accumulation so gradient magnitudes match larger real batches ---
+        loss = loss / accum
         scaler.scale(loss).backward()
 
-        if grad_clip is not None:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # We only unscale/clip/step when we are about to update
+        do_step = (step % accum == 0) or (step == total_steps)  # handle last partial window
 
-        # Add gradient accumulation (bigger global batch without more VRAM)
-        # scaler.step(optimizer)
-        # scaler.update()
-        if step % accum == 0:
+        if do_step:
+            if grad_clip is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        running += float(loss.item())
+        running += float(loss.item()) * accum  # report the original (un-divided) loss
         n += 1
 
         if step % log_interval == 0:
@@ -231,8 +288,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
             elapsed = time.time() - t0
             print(f"[Epoch {epoch:03d} | Step {step:05d}] loss={avg:.4f} ({format_seconds(elapsed)})")
 
+    # keep this throttled; logging every step adds overhead
     log_cuda()
-        # print(get_gpu_usage())
     return {"train_loss": running / max(1, n)}
 
 # ---------------------------
