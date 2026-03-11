@@ -1,36 +1,44 @@
-experiment_name: "seamless_base"
-seed: 42
-device: "auto"        # "auto" | "cpu" | "cuda" | "cuda:0" | "cuda:2"
-output_dir: "runs/seamless_base"
+experiment_name: "debug_run"
+# seed: 123
+device: "cuda:0"
+output_dir: "runs/debug_run"
 
 data:
-  train_csv: "/data1/open_data/seamless_interaction/preprocessed/train/clips.csv"
-  val_csv:   "/data1/open_data/seamless_interaction/preprocessed/val/clips.csv"   # or null to enable val_split
-  val_split: 0.05   # used only if val_csv is null
+  train_csv: "/project2/shrikann_35/hongn/SpeechGesSyn-CARE/clips2.csv"
+  val_csv: null       # derive a small val split
+  test_csv: "/project2/shrikann_35/hongn/SpeechGesSyn-CARE/test.csv"
+  val_split: 0.2
   resize: 224
-  batch_size: 4
-  num_workers: 4
-  pin_memory: false
+  batch_size: 2
+  num_workers: 2
+  pin_memory: True
+  max_len: 16          # max frames per video
 
-model:
-  # add kwargs your VideoFlowModel accepts, e.g.:
-  # hidden_dim: 768
-  # backbone_name: "timesformer"
+model: {}
 
 optim:
-  lr: 1.0e-5
-  weight_decay: 0.01
+  lr: 1.0e-3
+  weight_decay: 0
   betas: [0.9, 0.999]
 
 train:
-  epochs: 30
+  epochs: 100
   val_every: 1
-  amp: true           # mixed precision if CUDA available
-  grad_clip_norm: 1.0
+  amp: true
+  grad_clip_norm: 1.0 # null
+  accum_steps: 8 
 
 loss:
-  name: "global_clip"    # "global_clip" | "multimodal_alignment"
-  temperature: 0.07      # used by global_clip_loss
+  name: combined
+  losses:
+    - name: tri_semantic
+      weight: 1.0
+      temperature: 0.07
+
+    - name: trajectory
+      weight: 0.5
+      kwargs:
+        lambda_energy: 0.5
 
 logger:
   log_interval: 50

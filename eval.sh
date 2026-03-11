@@ -1,0 +1,1 @@
+python eval.py --config ./configs/base.yaml --checkpoint ./runs/debug_run/run20260308/best.pt

@@ -1,1 +1,1 @@
-python train.py --config ./configs/debug.yaml
+python train.py --config ./configs/base.yaml --resume ./runs/debug_run/run20260307/last.pt

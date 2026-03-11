@@ -4,7 +4,7 @@ device: "cuda:0"
 output_dir: "runs/debug_run"
 
 data:
-  train_csv: "/project2/shrikann_35/hongn/seamless_interaction/preprocessed/train/clips.csv"
+  train_csv: "/project2/shrikann_35/hongn/SpeechGesSyn-CARE/clips2.csv"
   val_csv: null       # derive a small val split
   val_split: 0.2
   resize: 224

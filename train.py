@@ -1,3 +1,14 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import warnings
+import traceback
+
+# def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#     traceback.print_stack()
+#     print(f"{filename}:{lineno}: {category.__name__}: {message}")
+
+# warnings.showwarning = warn_with_traceback
+
 import argparse
 import os
 import time
@@ -8,10 +19,9 @@ from torch.utils.data import DataLoader, random_split
 from torch.amp import GradScaler, autocast
 import yaml
 import logging
-# your code
-from loss import multimodal_alignment_loss, global_clip_loss
-from CAREdataset import SEAMLESSData, pad_time_collate
-from model import VideoFlowModel
+from loss import multimodal_alignment_loss, global_clip_loss, tri_semantic_loss, trajectory_alignment_loss
+from CAREdataset import pad_time_collate, SEAMLESSDataDEV, SEAMLESSDataSimple, simple_collate
+from model import VideoFlowModel, SpeechGestureModel, SpeechGestureModelDev
 from datetime import datetime
 from utils.utils import log_cuda
 import subprocess
@@ -67,10 +77,10 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
     pin_memory = data_cfg.get("pin_memory", False)
     max_len = data_cfg.get("max_len", 8)  # max frames per video
 
-    ds_train = SEAMLESSData(train_csv, resize=resize, max_len=max_len)
+    ds_train = SEAMLESSDataSimple(train_csv, resize=resize, max_len=max_len)
 
     if val_csv:
-        ds_val = SEAMLESSData(val_csv, resize=resize, max_len=max_len)
+        ds_val = SEAMLESSDataSimple(val_csv, resize=resize, max_len=max_len)
     else:
         # Fallback: small validation split from training data
         val_split = data_cfg.get("val_split", 0.05)
@@ -84,7 +94,7 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=pad_time_collate,
+        collate_fn=simple_collate,
         pin_memory=pin_memory,
         drop_last=False,
     )
@@ -94,7 +104,7 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=pad_time_collate,
+        collate_fn=simple_collate,
         pin_memory=pin_memory,
         drop_last=False,
     )
@@ -120,7 +130,8 @@ def log_trainable_params(model: nn.Module, log_file: str = "grad_params.log"):
 def build_model(cfg: Dict[str, Any], device: str) -> torch.nn.Module:
     model_cfg = cfg.get("model", {})
     # If your VideoFlowModel takes kwargs, pass them from model_cfg
-    model = VideoFlowModel(**model_cfg).to(device)
+    # model = VideoFlowModel(**model_cfg).to(device)
+    model = SpeechGestureModelDev(**model_cfg).to(device)
     return model
 
 def build_optimizer(cfg: Dict[str, Any], model: torch.nn.Module) -> torch.optim.Optimizer:
@@ -128,34 +139,121 @@ def build_optimizer(cfg: Dict[str, Any], model: torch.nn.Module) -> torch.optim.
     lr = optim_cfg.get("lr", 1e-5)
     weight_decay = optim_cfg.get("weight_decay", 0.0)
     betas = tuple(optim_cfg.get("betas", (0.9, 0.999)))
-    return torch.optim.AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=lr, weight_decay=weight_decay, betas=betas
+
+    # opt =  torch.optim.AdamW(
+    #     (p for p in model.parameters() if p.requires_grad),
+    #     lr=lr, weight_decay=weight_decay, betas=betas
+    # )
+    enc, heads = [], []
+    for n,p in model.named_parameters():
+        if not p.requires_grad: continue
+        (heads if ("vid_proj" in n or "txt_proj" in n or "logit_scale" in n) else enc).append(p)
+    opt = torch.optim.AdamW(
+        [{"params": enc,   "lr": cfg["optim"].get("lr_enc", 1e-5)},
+        {"params": heads, "lr": cfg["optim"].get("lr_head", 5e-3)}],
+        weight_decay=cfg["optim"].get("weight_decay", 0.01),
+        betas=(0.9, 0.999)
     )
+    return opt
 
 def build_scaler(cfg: Dict[str, Any]) -> GradScaler:
     use_amp = cfg["train"].get("amp", False) and torch.cuda.is_available()
     return GradScaler(enabled=use_amp)
 
+# def get_loss_fn(cfg: Dict[str, Any]):
+#     loss_cfg = cfg["loss"]
+#     name = loss_cfg.get("name", "global_clip").lower()
+#     if name in ["global_clip", "global_clip_loss"]:
+#         def _loss(v_feats, t_feats, v_mask=None, t_mask=None):
+#             return global_clip_loss(
+#                 v_feats, t_feats,
+#                 v_mask=v_mask, t_mask=t_mask,
+#                 temperature=loss_cfg.get("temperature", 0.07)
+#             )
+#         return _loss
+#     elif name in ["multimodal_alignment", "multimodal_alignment_loss", "alignment"]:
+#         def _loss(v_feats, t_feats, v_mask=None, t_mask=None):
+#             return multimodal_alignment_loss(
+#                 v_feats, t_feats,
+#                 v_mask=v_mask, t_mask=t_mask,
+#                 **loss_cfg.get("kwargs", {})
+#             )
+#         return _loss
+#     else:
+#         raise ValueError(f"Unknown loss name: {name}")
+
+from typing import Dict, Any
+
+
 def get_loss_fn(cfg: Dict[str, Any]):
     loss_cfg = cfg["loss"]
     name = loss_cfg.get("name", "global_clip").lower()
-    if name in ["global_clip", "global_clip_loss"]:
-        def _loss(v_feats, t_feats, v_mask=None, t_mask=None):
-            return global_clip_loss(
-                v_feats, t_feats,
-                v_mask=v_mask, t_mask=t_mask,
-                temperature=loss_cfg.get("temperature", 0.07)
+
+    # -------------------------------------------------
+    # Single Losses
+    # -------------------------------------------------
+
+    if name in ["tri_semantic"]:
+        def _loss(speech_feats, video_feats, text_feats, **kwargs):
+            return tri_semantic_loss(
+                speech_feats,
+                video_feats,
+                text_feats,
+                temperature=loss_cfg.get("temperature", 0.07),
             )
         return _loss
-    elif name in ["multimodal_alignment", "multimodal_alignment_loss", "alignment"]:
-        def _loss(v_feats, t_feats, v_mask=None, t_mask=None):
-            return multimodal_alignment_loss(
-                v_feats, t_feats,
-                v_mask=v_mask, t_mask=t_mask,
+
+    elif name in ["trajectory"]:
+        def _loss(speech_feats, video_feats, text_feats, **kwargs):
+            return trajectory_alignment_loss(
+                speech_feats,
+                video_feats,
+                text_feats,
                 **loss_cfg.get("kwargs", {})
             )
         return _loss
+
+    # -------------------------------------------------
+    # Combined Loss
+    # -------------------------------------------------
+
+    elif name in ["combined", "multi", "multi_loss"]:
+
+        loss_list = loss_cfg.get("losses", [])
+
+        def _loss(speech_feats, video_feats, text_feats, **kwargs):
+
+            total_loss = 0.0
+
+            for sub in loss_list:
+                sub_name = sub["name"].lower()
+                weight = sub.get("weight", 1.0)
+
+                if sub_name == "tri_semantic":
+                    l = tri_semantic_loss(
+                        speech_feats,
+                        video_feats,
+                        text_feats,
+                        temperature=sub.get("temperature", 0.07)
+                    )
+
+                elif sub_name == "trajectory":
+                    l = trajectory_alignment_loss(
+                        speech_feats,
+                        video_feats,
+                        text_feats,
+                        **sub.get("kwargs", {})
+                    )
+
+                else:
+                    raise ValueError(f"Unknown sub-loss: {sub_name}")
+
+                total_loss = total_loss + weight * l
+
+            return total_loss
+
+        return _loss
+
     else:
         raise ValueError(f"Unknown loss name: {name}")
 
@@ -171,12 +269,27 @@ def evaluate(model, loader, device: str, loss_fn, cfg: Dict[str, Any]) -> Dict[s
     for batch in loader:
         vids = move_to_device(batch["video"], device)  # (B, C, T, H, W) after pad/collate
         transcript = move_to_device(batch["transcript"], device)  # tensor or dict->tensor(s)
-
+        audio_mask = move_to_device(batch.get("audio_mask", None), device) if "audio_mask" in batch else None
+        audio      = move_to_device(batch.get("audio", None), device) if "audio" in batch else None
+        # flows      = move_to_device(batch.get("flows", None), device) if "flows" in batch else None
         v_mask = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
-        t_mask = move_to_device(batch.get("text_mask", None), device) if "text_mask" in batch else None
+        # t_mask = move_to_device(batch.get("text_mask", None), device) if "text_mask" in batch else None
 
-        v_feats, t_feats = model(vids, transcript)  # v:[B,T1,D], t:[B,T2,D]
-        loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
+        v_feats, a_ft_feats, t_feats = model(video=vids, 
+                                         flows=None,
+                                         transcript=transcript, 
+                                         audio=audio, 
+                                         audio_mask=audio_mask)  # v:[B,T1,D], t:[B,T2,D]
+                
+        loss = loss_fn(
+            speech_feats=v_feats,
+            video_feats=a_ft_feats,
+            text_feats=t_feats,
+        )
+        # v_feats, t_feats = model(**batch)
+
+        # mask = [round(n / 30) for n in audio_mask] 
+        # loss = loss_fn(v_feats, t_feats, v_mask=mask, t_mask=mask)  # + some_audio_loss(...)
 
         total_loss += float(loss.item())
         n_batches += 1
@@ -254,15 +367,32 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
     for step, batch in enumerate(loader, 1):
         vids       = move_to_device(batch["video"], device)
         transcript = move_to_device(batch["transcript"], device)
-        v_mask     = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
+        # v_mask     = move_to_device(batch.get("video_mask", None), device) if "video_mask" in batch else None
         t_mask     = move_to_device(batch.get("text_mask", None), device)  if "text_mask"  in batch else None
+        audio_mask = move_to_device(batch.get("audio_mask", None), device) if "audio_mask" in batch else None
+        audio      = move_to_device(batch.get("audio", None), device) if "audio" in batch else None
+        # flows      = move_to_device(batch.get("flows", None), device) if "flows" in batch else None
+        # audio_lengths = audio_mask.sum(dim=1)   # (B,), in samples
 
+        # assert False, f"{flows.shape}, {vids.shape}"
         # --- forward (AMP + memory-efficient attention recommended) ---
         with autocast(device_type="cuda", enabled=use_amp):
             # Enable Flash/SDPA where possible (PyTorch 2.x)
             with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
-                v_feats, t_feats = model(vids, transcript)
-                loss = loss_fn(v_feats, t_feats, v_mask=v_mask, t_mask=t_mask)
+                v_feats, a_ft_feats, t_feats = model(video=vids, 
+                                         flows=None,
+                                         transcript=transcript, 
+                                         audio=audio, 
+                                         audio_mask=audio_mask)  # v:[B,T1,D], t:[B,T2,D]
+                
+                loss = loss_fn(
+                    speech_feats=v_feats,
+                    video_feats=a_ft_feats,
+                    text_feats=t_feats,
+                )
+                # mask = [round(n / 30) for n in audio_mask] 
+
+                # loss = loss_fn(v_feats, t_feats, v_mask=mask, t_mask=mask)  # + some_audio_loss(...)
 
         # --- scale loss by accumulation so gradient magnitudes match larger real batches ---
         loss = loss / accum

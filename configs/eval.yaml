@@ -1,0 +1,44 @@
+experiment_name: "debug_run"
+# seed: 123
+device: "cuda:0"
+output_dir: "runs/debug_run"
+
+data:
+  train_csv: "/project2/shrikann_35/hongn/SpeechGesSyn-CARE/clips2.csv"
+  val_csv: null       # derive a small val split
+  test_csv: "/project2/shrikann_35/hongn/SpeechGesSyn-CARE/test.csv"
+  val_split: 0.2
+  resize: 224
+  batch_size: 1
+  num_workers: 1
+  pin_memory: True
+  max_len: 16          # max frames per video
+
+model: {}
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 0
+  betas: [0.9, 0.999]
+
+train:
+  epochs: 100
+  val_every: 1
+  amp: true
+  grad_clip_norm: 1.0 # null
+  accum_steps: 8 
+
+loss:
+  name: combined
+  losses:
+    - name: tri_semantic
+      weight: 1.0
+      temperature: 0.07
+
+    - name: trajectory
+      weight: 0.5
+      kwargs:
+        lambda_energy: 0.5
+
+logger:
+  log_interval: 50
