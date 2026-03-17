@@ -3,10 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForMaskedLM, AutoModelForImageClassification, TimesformerModel, WhisperProcessor, WhisperModel
+from transformers import AutoModelForMaskedLM, AutoModelForImageClassification, TimesformerModel, WhisperProcessor, WhisperModel, XLMRobertaModel
 from PIL import Image
 from einops import rearrange
 from mamba_ssm import Mamba
+from utils.modules import MultiHeadedAttention_Transformer, PositionwiseFeedForward_Transformer, PositionalEncoding_Transformer, Encoder_Transformer, EncoderLayer_Transformer
+import copy
 # from typing import Any, Dict, Tuple, Union
 
 # def move_to_device(batch_item: Union[torch.Tensor, Dict[str, torch.Tensor]], device: str):
@@ -393,8 +395,166 @@ class SpeechGestureModel(nn.Module):
     #     # assert False, f"{a_out.shape}, {f_out.shape}, {mask}"
     #     return a_feats, f_feats
 
-
-
+class JEGAL(nn.Module):
+    """
+    Joint Embedding of Gestures, Audio and Language.
+ 
+    Tokenization is handled upstream in the dataloader.
+ 
+    Inputs
+    ------
+    video      : (B, 16, 3, 224, 224)  raw RGB frames
+    flows      : ignored — kept for interface parity with SpeechGestureModelDev
+    transcript : (B, 16)               pre-tokenized input IDs
+    audio      : (B, 80, 3000)         log-mel spectrogram
+    audio_mask : (B,)                  valid-length mask per sample
+ 
+    Outputs
+    -------
+    x       : (B, 16, 384)   gesture embeddings
+    a_feats : (B, 16, 384)   audio  embeddings
+    t_feats : (B, 16, 384)   text   embeddings
+    """
+ 
+    def __init__(
+        self,
+        d_model: int = 384,
+        d_model_text: int = 768,
+        N: int = 6,
+        N_text: int = 3,
+        h: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+ 
+        c = copy.deepcopy
+ 
+        # XLM-R backbone — frozen, not trained
+        self.mroberta = XLMRobertaModel.from_pretrained("xlm-roberta-base")
+        self.mroberta.eval()
+        self.mroberta.requires_grad_(False)
+ 
+        # ------------------------------------------------------------------ #
+        # Gesture / visual stream
+        # Input : (B, 16, 3, 224, 224)
+        # A lightweight per-frame CNN reduces each 224x224 frame to a vector,
+        # then a positional transformer refines the 16-frame sequence.
+        # ------------------------------------------------------------------ #
+ 
+        # Per-frame spatial encoder: 3x224x224 -> d_model
+        self.frame_encoder = nn.Sequential(
+            nn.Conv2d(3,  32, kernel_size=7, stride=2, padding=3, bias=False),  # 112x112
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),  # 56x56
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False), # 28x28
+            nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),                                             # 1x1
+            nn.Flatten(),                                                        # (B*T, 128)
+            nn.Linear(128, d_model),
+        )
+ 
+        # Temporal transformer over 16 frames
+        attn_rgb = MultiHeadedAttention_Transformer(h, d_model, dropout=dropout)
+        ff_rgb   = PositionwiseFeedForward_Transformer(d_model, d_model * 4, dropout)
+        self.position_rgb = PositionalEncoding_Transformer(d_model, dropout)
+        self.encoder_rgb  = Encoder_Transformer(
+            EncoderLayer_Transformer(d_model, c(attn_rgb), c(ff_rgb), dropout), N
+        )
+        self.proj_op_rgb = nn.Linear(d_model, d_model)
+ 
+        # ------------------------------------------------------------------ #
+        # Text stream
+        # Input : (B, 16)  pre-tokenized IDs
+        # XLM-R produces (B, 16, 768); a shallow transformer + projection -> 384
+        # ------------------------------------------------------------------ #
+        attn_text = MultiHeadedAttention_Transformer(h, d_model_text, dropout=dropout)
+        ff_text   = PositionwiseFeedForward_Transformer(d_model_text, d_model_text * 4, dropout)
+        self.encoder_text = Encoder_Transformer(
+            EncoderLayer_Transformer(d_model_text, c(attn_text), c(ff_text), dropout), N_text
+        )
+        self.proj_op_text = nn.Linear(d_model_text, d_model)
+ 
+        # ------------------------------------------------------------------ #
+        # Audio stream
+        # Input : (B, 80, 3000)  log-mel spectrogram
+        # CNN over the mel axis collapses frequency, yielding (B, T_a, C);
+        # adaptive pool to 16 time steps -> (B, 16, d_model)
+        # ------------------------------------------------------------------ #
+        self.audio_cnn = nn.Sequential(
+            nn.Conv1d(80,  128, kernel_size=5, stride=1, padding=2), nn.BatchNorm1d(128), nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1), nn.BatchNorm1d(256), nn.ReLU(),
+            nn.Conv1d(256, 256, kernel_size=3, stride=2, padding=1), nn.BatchNorm1d(256), nn.ReLU(),
+            nn.Conv1d(256, d_model, kernel_size=3, stride=2, padding=1),
+        )
+        self.proj_op_audio = nn.Linear(d_model, d_model)
+ 
+    # ======================================================================= #
+    # ----------------  Single-stream encoders  ----------------------------- #
+    # ======================================================================= #
+ 
+    def _encode_gestures(self, video: torch.Tensor) -> torch.Tensor:
+        """
+        (B, T, 3, H, W) -> (B, T, d_model)
+        Encodes each frame independently, then applies a temporal transformer.
+        """
+        B, T, C, H, W = video.shape
+        frames = video.view(B * T, C, H, W)                  # (B*T, 3, H, W)
+        frame_feats = self.frame_encoder(frames)              # (B*T, d_model)
+        x = frame_feats.view(B, T, -1)                        # (B, T, d_model)
+        x = self.position_rgb(x)
+        x = self.encoder_rgb(x)
+        return self.proj_op_rgb(x)                            # (B, T, d_model)
+ 
+    def _encode_text(self, transcript: torch.Tensor) -> torch.Tensor:
+        """
+        (B, L)  pre-tokenized IDs -> (B, L, d_model)
+        Frozen XLM-R hidden states refined by a shallow trainable transformer.
+        """
+        attention_mask = (transcript != 1).long()             # 1 = XLM-R pad id
+        with torch.no_grad():
+            roberta_out = self.mroberta(transcript, attention_mask=attention_mask)
+        text_emb = roberta_out.last_hidden_state              # (B, L, 768)
+ 
+        x = self.encoder_text(text_emb)                       # (B, L, 768)
+        return self.proj_op_text(x)                           # (B, L, d_model)
+ 
+    def _encode_audio(self, audio: torch.Tensor, target_len: int) -> torch.Tensor:
+        """
+        (B, 80, 3000) -> (B, target_len, d_model)
+        1-D CNN over frequency/time, then adaptive pool to target_len.
+        """
+        x = self.audio_cnn(audio)                             # (B, d_model, T_reduced)
+        x = F.adaptive_avg_pool1d(x, target_len)              # (B, d_model, target_len)
+        x = x.transpose(1, 2)                                 # (B, target_len, d_model)
+        return self.proj_op_audio(x)                          # (B, target_len, d_model)
+ 
+    # ======================================================================= #
+    # ============  Primary interface  (matches SpeechGestureModelDev)  ===== #
+    # ======================================================================= #
+ 
+    def forward(
+        self,
+        video:      torch.Tensor,   # (B, 16, 3, 224, 224)
+        flows,                      # ignored — interface parity
+        transcript: torch.Tensor,   # (B, 16)  pre-tokenized IDs
+        audio:      torch.Tensor,   # (B, 80, 3000)
+        audio_mask: torch.Tensor,   # (B,)
+    ):
+        """
+        Returns
+        -------
+        x       : (B, 16, 384)  gesture embeddings
+        a_feats : (B, 16, 384)  audio  embeddings
+        t_feats : (B, 16, 384)  text   embeddings
+        """
+        T = video.shape[1]                      # 16
+ 
+        x       = self._encode_gestures(video)          # (B, 16, 384)
+        t_feats = self._encode_text(transcript)          # (B, 16, 384)
+        a_feats = self._encode_audio(audio, T)           # (B, 16, 384)
+ 
+        return x, a_feats, t_feats
 
 class SpeechGestureModelDev(nn.Module):
     """
@@ -672,7 +832,7 @@ class SpeechGestureModelDev(nn.Module):
         #Text encoding
         t_feats = self.encode_text(transcript, self.text_enc)    # (B, T_t, D_t)
         t_feats = self.txt_proj(t_feats)
-        # assert False, f"{x.shape}, {a_feats.shape}, {t_feats.shape}, {transcript}"
+        assert False, f"{x.shape}, {a_feats.shape}, {t_feats.shape}, {transcript}"
         return x, a_feats, t_feats
 
 

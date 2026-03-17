@@ -21,7 +21,7 @@ import yaml
 import logging
 from loss import multimodal_alignment_loss, global_clip_loss, tri_semantic_loss, trajectory_alignment_loss
 from CAREdataset import pad_time_collate, SEAMLESSDataDEV, SEAMLESSDataSimple, simple_collate
-from model import VideoFlowModel, SpeechGestureModel, SpeechGestureModelDev
+from model import VideoFlowModel, SpeechGestureModel, SpeechGestureModelDev, JEGAL
 from datetime import datetime
 from utils.utils import log_cuda
 import subprocess
@@ -131,7 +131,7 @@ def build_model(cfg: Dict[str, Any], device: str) -> torch.nn.Module:
     model_cfg = cfg.get("model", {})
     # If your VideoFlowModel takes kwargs, pass them from model_cfg
     # model = VideoFlowModel(**model_cfg).to(device)
-    model = SpeechGestureModelDev(**model_cfg).to(device)
+    model = JEGAL(**model_cfg).to(device)
     return model
 
 def build_optimizer(cfg: Dict[str, Any], model: torch.nn.Module) -> torch.optim.Optimizer:
@@ -374,7 +374,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device: str, loss_fn, epoc
         # flows      = move_to_device(batch.get("flows", None), device) if "flows" in batch else None
         # audio_lengths = audio_mask.sum(dim=1)   # (B,), in samples
 
-        # assert False, f"{flows.shape}, {vids.shape}"
+        # assert False, f"{audio.shape}, {vids.shape}, {transcript.shape}, {audio_mask.shape}"
         # --- forward (AMP + memory-efficient attention recommended) ---
         with autocast(device_type="cuda", enabled=use_amp):
             # Enable Flash/SDPA where possible (PyTorch 2.x)

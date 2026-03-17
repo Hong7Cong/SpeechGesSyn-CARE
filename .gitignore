@@ -21,3 +21,4 @@
 *.tar
 *.npy
 *.npz
+flash-attention
